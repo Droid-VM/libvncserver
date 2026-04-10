@@ -1521,7 +1521,7 @@ char *rfbProcessFileTransferReadBuffer(rfbClientPtr cl, uint32_t length)
        that might wrap on platforms with a 32-bit int type if length is bigger
        than 0X7FFFFFFF.
     */
-    if(length == SIZE_MAX || length > INT_MAX) {
+    if(length > INT_MAX) {
 	rfbErr("rfbProcessFileTransferReadBuffer: too big file transfer length requested: %u", (unsigned int)length);
 	rfbCloseClient(cl);
 	return NULL;
@@ -1739,7 +1739,7 @@ rfbBool rfbProcessFileTransfer(rfbClientPtr cl, uint8_t contentType, uint8_t con
         /* The client requests a File */
         if (!rfbFilenameTranslate2UNIX(cl, buffer, filename1, sizeof(filename1)))
             goto fail;
-        cl->fileTransfer.fd=open(filename1, O_RDONLY, 0744);
+        cl->fileTransfer.fd=open(filename1, O_RDONLY);
 
         /*
         */
@@ -2147,7 +2147,7 @@ rfbProcessExtendedServerCutTextData(rfbClientPtr cl, uint32_t flags, const char 
         return FALSE;
     }
     stream.avail_in = len;
-    stream.next_in = data;
+    stream.next_in = (Bytef *) data;
     for (i = 0; i < 16; i++) {
         if (!(flags & (1 << i))) {
             continue;

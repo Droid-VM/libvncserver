@@ -15,6 +15,10 @@
 #endif
 #include <rfb/rfb.h>
 #include <rfb/rfbregion.h>
+#ifndef WIN32
+#include <poll.h>
+#include <errno.h>
+#endif
 #include "private.h"
 
 #include <stdarg.h>
@@ -528,42 +532,56 @@ clientInput(void *data)
     uintptr_t output_thread = _beginthread(clientOutput, 0, cl);
 #endif
 
+    /* DroidVM: poll(), not select().
+     *
+     * select() cannot express a file descriptor numbered at or above FD_SETSIZE, which is 1024 and
+     * not adjustable -- fd_set is a fixed-size bitmap. On bionic, FD_SET is FORTIFY-checked, so
+     * exceeding it is not a silently corrupted bitmap but an immediate abort:
+     *
+     *   FORTIFY: FD_SET: file descriptor 1073 >= FD_SETSIZE 1024
+     *   Fatal signal 6 (SIGABRT) in tid ... (v_gpu), pid ... (crosvm)
+     *
+     * That is not hypothetical here. This library is linked into a VMM whose GPU device holds one
+     * dma-buf descriptor per guest buffer object -- over a thousand of them in a running game --
+     * so an accepted VNC socket is routinely numbered above 1023. The abort then takes the VMM
+     * down, and on this platform a dying VMM resets the whole phone.
+     *
+     * Note what the limit is on: the fd NUMBER, not how many are open. Raising RLIMIT_NOFILE does
+     * not help, and neither does closing other descriptors, once a high number has been handed out.
+     * poll() has no such ceiling, and the mapping is exact:
+     *   readable  -> POLLIN  | POLLPRI
+     *   exception -> POLLERR | POLLHUP | POLLNVAL   (select's efds, for a socket)
+     *   writable  -> POLLOUT
+     */
     while (cl->state != RFB_SHUTDOWN) {
-	fd_set rfds, wfds, efds;
-	struct timeval tv;
-	int n;
+	struct pollfd pfd[2];
+	int npfd, n;
 
 	if (cl->sock == RFB_INVALID_SOCKET) {
 	  /* Client has disconnected. */
             break;
         }
 
-	FD_ZERO(&rfds);
-	FD_SET(cl->sock, &rfds);
-#ifndef WIN32
-	FD_SET(cl->pipe_notify_client_thread[0], &rfds);
-#endif
-	FD_ZERO(&efds);
-	FD_SET(cl->sock, &efds);
-
+	pfd[0].fd = cl->sock;
+	pfd[0].events = POLLIN | POLLPRI;
 	/* Are we transferring a file in the background? */
-	FD_ZERO(&wfds);
 	if ((cl->fileTransfer.fd!=-1) && (cl->fileTransfer.sending==1))
-	    FD_SET(cl->sock, &wfds);
-
+	    pfd[0].events |= POLLOUT;
+	pfd[0].revents = 0;
+	npfd = 1;
 #ifndef WIN32
-	int nfds = cl->pipe_notify_client_thread[0] > cl->sock ? cl->pipe_notify_client_thread[0] : cl->sock;
-#else
-	int nfds = cl->sock;
+	pfd[1].fd = cl->pipe_notify_client_thread[0];
+	pfd[1].events = POLLIN;
+	pfd[1].revents = 0;
+	npfd = 2;
 #endif
 
-	tv.tv_sec = 60; /* 1 minute */
-	tv.tv_usec = 0;
-
-	n = select(nfds + 1, &rfds, &wfds, &efds, &tv);
+	n = poll(pfd, npfd, 60 * 1000); /* 1 minute */
 
 	if (n < 0) {
-	    rfbLogPerror("ReadExact: select");
+	    if (errno == EINTR)
+		continue;
+	    rfbLogPerror("ReadExact: poll");
 	    break;
 	}
 	if (n == 0) /* timeout */
@@ -573,7 +591,7 @@ clientInput(void *data)
         }
 
 #ifndef WIN32
-	if (FD_ISSET(cl->pipe_notify_client_thread[0], &rfds))
+	if (pfd[1].revents & (POLLIN | POLLERR | POLLHUP | POLLNVAL))
 	{
 	    /* Reset the pipe */
 	    char buf;
@@ -583,10 +601,10 @@ clientInput(void *data)
 #endif
 
         /* We have some space on the transmit queue, send some data */
-        if (FD_ISSET(cl->sock, &wfds))
+        if (pfd[0].revents & POLLOUT)
             rfbSendFileTransferChunk(cl);
 
-        if (FD_ISSET(cl->sock, &rfds) || FD_ISSET(cl->sock, &efds))
+        if (pfd[0].revents & (POLLIN | POLLPRI | POLLERR | POLLHUP | POLLNVAL))
         {
 #ifdef LIBVNCSERVER_WITH_WEBSOCKETS
             do {
@@ -622,8 +640,8 @@ listenerRun(void *data)
     struct sockaddr_storage peer;
     rfbClientPtr cl = NULL;
     socklen_t len;
-    fd_set listen_fds;  /* temp file descriptor list for select() */
-    struct timeval tv;
+    struct pollfd lpfd[3];  /* listenSock, listen6Sock, notify pipe */
+    int npfd, notify_idx = -1;
 
     /*
       Only checking socket state here and not using rfbIsActive()
@@ -638,25 +656,39 @@ listenerRun(void *data)
     while (screen->socketState != RFB_SOCKET_SHUTDOWN) {
         client_fd = -1;
         cl = NULL;
-        FD_ZERO(&listen_fds);
-	if(screen->listenSock != RFB_INVALID_SOCKET)
-	  FD_SET(screen->listenSock, &listen_fds);
-	if(screen->listen6Sock != RFB_INVALID_SOCKET)
-	  FD_SET(screen->listen6Sock, &listen_fds);
+        /* poll() here for the same reason as clientInput above: the listen sockets and the notify
+         * pipe are opened early and are usually low-numbered, but nothing guarantees that, and a
+         * single high fd is an abort rather than a degradation. */
+        npfd = 0;
+	if(screen->listenSock != RFB_INVALID_SOCKET) {
+	  lpfd[npfd].fd = screen->listenSock;
+	  lpfd[npfd].events = POLLIN;
+	  lpfd[npfd].revents = 0;
+	  npfd++;
+	}
+	if(screen->listen6Sock != RFB_INVALID_SOCKET) {
+	  lpfd[npfd].fd = screen->listen6Sock;
+	  lpfd[npfd].events = POLLIN;
+	  lpfd[npfd].revents = 0;
+	  npfd++;
+	}
 #ifndef WIN32
-	FD_SET(screen->pipe_notify_listener_thread[0], &listen_fds);
-	screen->maxFd = rfbMax(screen->maxFd, screen->pipe_notify_listener_thread[0]);
+	notify_idx = npfd;
+	lpfd[npfd].fd = screen->pipe_notify_listener_thread[0];
+	lpfd[npfd].events = POLLIN;
+	lpfd[npfd].revents = 0;
+	npfd++;
 #endif
 
-        tv.tv_sec = 0;
-	tv.tv_usec = screen->select_timeout_usec;
-        if (select(screen->maxFd+1, &listen_fds, NULL, NULL, &tv) == -1) {
-            rfbLogPerror("listenerRun: error in select");
+        if (poll(lpfd, npfd, (int)(screen->select_timeout_usec / 1000)) == -1) {
+            if (errno == EINTR)
+                continue;
+            rfbLogPerror("listenerRun: error in poll");
             return THREAD_ROUTINE_RETURN_VALUE;
         }
 
 #ifndef WIN32
-	if (FD_ISSET(screen->pipe_notify_listener_thread[0], &listen_fds))
+	if (lpfd[notify_idx].revents & (POLLIN | POLLERR | POLLHUP | POLLNVAL))
 	{
 	    /* Reset the pipe */
 	    char buf;
@@ -666,12 +698,26 @@ listenerRun(void *data)
 	}
 #endif
 
-	/* If there is something on the listening sockets, handle new connections */
+	/* If there is something on the listening sockets, handle new connections.
+	 * The pollfd slots were filled in the same order the sockets are tested here, so match on
+	 * fd rather than on a fixed index -- either listen socket may be absent. */
 	len = sizeof (peer);
-	if (screen->listenSock != RFB_INVALID_SOCKET && FD_ISSET(screen->listenSock, &listen_fds))
-	    client_fd = accept(screen->listenSock, (struct sockaddr*)&peer, &len);
-	else if (screen->listen6Sock != RFB_INVALID_SOCKET && FD_ISSET(screen->listen6Sock, &listen_fds))
-	    client_fd = accept(screen->listen6Sock, (struct sockaddr*)&peer, &len);
+	{
+	    int i, ready4 = 0, ready6 = 0;
+
+	    for (i = 0; i < npfd; i++) {
+		if (!(lpfd[i].revents & (POLLIN | POLLERR | POLLHUP | POLLNVAL)))
+		    continue;
+		if (screen->listenSock != RFB_INVALID_SOCKET && lpfd[i].fd == screen->listenSock)
+		    ready4 = 1;
+		else if (screen->listen6Sock != RFB_INVALID_SOCKET && lpfd[i].fd == screen->listen6Sock)
+		    ready6 = 1;
+	    }
+	    if (ready4)
+		client_fd = accept(screen->listenSock, (struct sockaddr*)&peer, &len);
+	    else if (ready6)
+		client_fd = accept(screen->listen6Sock, (struct sockaddr*)&peer, &len);
+	}
 
 	if(client_fd >= 0)
 	  cl = rfbNewClient(screen,client_fd);

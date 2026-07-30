@@ -52,6 +52,10 @@
 #endif
 
 #include <rfb/rfb.h>
+#ifndef WIN32
+#include <poll.h>
+#include <errno.h>
+#endif
 
 #ifdef LIBVNCSERVER_HAVE_SYS_TYPES_H
 #include <sys/types.h>
@@ -561,10 +565,14 @@ rfbCloseClient(rfbClientPtr cl)
     if (cl->sock != RFB_INVALID_SOCKET)
 #endif
       {
-	/* Remove client sock from allFds and adapt maxFd */
-	FD_CLR(cl->sock,&(cl->screen->allFds));
+	/* Remove client sock from allFds and adapt maxFd.
+	 * Guarded rather than polled: this is bookkeeping, nothing is being waited on. A socket
+	 * above FD_SETSIZE was never added (see rfbserver.c), so there is nothing to clear. */
+	if (cl->sock >= 0 && cl->sock < FD_SETSIZE)
+	  FD_CLR(cl->sock,&(cl->screen->allFds));
 	if(cl->sock==cl->screen->maxFd)
 	  while(cl->screen->maxFd>0
+		&& cl->screen->maxFd < FD_SETSIZE
 		&& !FD_ISSET(cl->screen->maxFd,&(cl->screen->allFds)))
 	    cl->screen->maxFd--;
 #ifdef LIBVNCSERVER_WITH_WEBSOCKETS
@@ -658,6 +666,7 @@ const uint8_t *fuzz_data;
 int
 rfbReadExactTimeout(rfbClientPtr cl, char* buf, int len, int timeout)
 {
+    struct pollfd pfd;
 #ifdef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
     if (fuzz_offset + len <= fuzz_size) {
         memcpy(buf, fuzz_data + fuzz_offset, len);
@@ -713,17 +722,21 @@ rfbReadExactTimeout(rfbClientPtr cl, char* buf, int len, int timeout)
 		    continue;
 	    }
 #endif
-            FD_ZERO(&fds);
-            FD_SET(sock, &fds);
-            tv.tv_sec = timeout / 1000;
-            tv.tv_usec = (timeout % 1000) * 1000;
-            n = select(sock+1, &fds, NULL, &fds, &tv);
+            /* DroidVM: poll(), not select() -- see the note in rfbserver.c. A client socket here
+             * can be numbered above FD_SETSIZE, and FD_SET on it aborts the process under bionic's
+             * FORTIFY. This is on the read path of every partial RFB message. */
+            pfd.fd = sock;
+            pfd.events = POLLIN | POLLPRI;
+            pfd.revents = 0;
+            n = poll(&pfd, 1, timeout);
             if (n < 0) {
-                rfbLogPerror("ReadExact: select");
+                if (errno == EINTR)
+                    continue;
+                rfbLogPerror("ReadExact: poll");
                 return n;
             }
             if (n == 0) {
-                rfbErr("ReadExact: select timeout\n");
+                rfbErr("ReadExact: poll timeout\n");
                 errno = ETIMEDOUT;
                 return -1;
             }
@@ -844,6 +857,7 @@ rfbWriteExact(rfbClientPtr cl,
               const char *buf,
               int len)
 {
+    struct pollfd pfd;
 #ifdef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
     return 1;
 #endif
@@ -922,11 +936,12 @@ rfbWriteExact(rfbClientPtr cl,
                need to do this because select doesn't necessarily return
                immediately when the other end has gone away */
 
-            FD_ZERO(&fds);
-            FD_SET(sock, &fds);
-            tv.tv_sec = 5;
-            tv.tv_usec = 0;
-            n = select(sock+1, NULL, &fds, NULL /* &fds */, &tv);
+            /* DroidVM: poll(), not select(). This one is hit on every back-pressured update, so
+             * at any real resolution it is the site a high-numbered socket reaches first. */
+            pfd.fd = sock;
+            pfd.events = POLLOUT;
+            pfd.revents = 0;
+            n = poll(&pfd, 1, 5 * 1000);
 	    if (n < 0) {
 #ifdef WIN32
                 errno=WSAGetLastError();

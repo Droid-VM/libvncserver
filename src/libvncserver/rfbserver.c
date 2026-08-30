@@ -115,6 +115,52 @@ static const int tight2turbo_subsamp[10] = {
 };
 #endif
 
+/* DroidVM: FD_SETSIZE-safe bookkeeping helpers.
+ *
+ * fd_set cannot represent a descriptor numbered at or above FD_SETSIZE (1024, fixed -- fds_bits is
+ * a fixed-size array), and on bionic FD_SET/FD_CLR/FD_ISSET are FORTIFY-checked, so exceeding it
+ * aborts the process rather than corrupting a bitmap:
+ *
+ *   FORTIFY: FD_SET: file descriptor 1073 >= FD_SETSIZE 1024
+ *
+ * That is reachable here. This library is linked into a VMM whose GPU device holds several dma-buf
+ * descriptors per guest buffer object, so an accepted VNC socket is routinely numbered above 1023,
+ * and rfbNewTCPOrUDPClient's FD_SET on it is the first thing to touch that number. The abort takes
+ * the VMM down, and on that platform a dying VMM resets the device.
+ *
+ * allFds and maxFd are only ever READ by rfbCheckFds/rfbProcessNewConnection, i.e. only on the
+ * rfbProcessEvents polling path. In background mode (rfbRunEventLoop with a listener thread, which
+ * is how the VMM drives this) they are write-only, so skipping a high fd loses nothing there. On
+ * the polling path a skipped fd would not be serviced -- that is a real limitation, and it is why
+ * this warns rather than failing silently.
+ */
+static int rfbFdSetSafe(int fd, fd_set *set, const char *what)
+{
+    if (fd < 0 || fd >= FD_SETSIZE) {
+        static int warned = 0;
+        if (!warned) {
+            warned = 1;
+            rfbLog("%s: fd %d is at or above FD_SETSIZE %d; not tracking it in the fd_set. "
+                   "This is harmless with a listener thread (nothing reads the set) but the "
+                   "rfbProcessEvents path would not service it.\n", what, fd, (int)FD_SETSIZE);
+        }
+        return 0;
+    }
+    FD_SET(fd, set);
+    return 1;
+}
+
+static void rfbFdClrSafe(int fd, fd_set *set)
+{
+    if (fd >= 0 && fd < FD_SETSIZE)
+        FD_CLR(fd, set);
+}
+
+static int rfbFdIsSetSafe(int fd, fd_set *set)
+{
+    return (fd >= 0 && fd < FD_SETSIZE) ? FD_ISSET(fd, set) : 0;
+}
+
 static void rfbProcessClientProtocolVersion(rfbClientPtr cl);
 static void rfbProcessClientNormalMessage(rfbClientPtr cl);
 static void rfbProcessClientInitMessage(rfbClientPtr cl);
@@ -369,7 +415,7 @@ rfbNewTCPOrUDPClient(rfbScreenInfoPtr rfbScreen,
 	rfbLogPerror("setsockopt failed: can't set TCP_NODELAY flag, non TCP socket?");
       }
 
-      FD_SET(sock,&(rfbScreen->allFds));
+      rfbFdSetSafe(sock, &(rfbScreen->allFds), "rfbNewClient");
 		rfbScreen->maxFd = rfbMax(sock,rfbScreen->maxFd);
 #endif
 
@@ -601,7 +647,7 @@ rfbClientConnectionGone(rfbClientPtr cl)
     free(cl->afterEncBuf);
 
     if(cl->sock != RFB_INVALID_SOCKET)
-       FD_CLR(cl->sock,&(cl->screen->allFds));
+       rfbFdClrSafe(cl->sock, &(cl->screen->allFds));
 
     cl->clientGoneHook(cl);
 
